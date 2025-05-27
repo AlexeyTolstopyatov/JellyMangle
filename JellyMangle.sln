@@ -1,0 +1,23 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{F70658DC-EC3E-4FE0-AF7C-4DF91D88F4AD}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "test", "test", "{FCCBF7CD-6EE8-42AA-A1AE-82F1AF34A900}"
+EndProject
+Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "JellyMangle.Itanium", "JellyMangle.Itanium\JellyMangle.Itanium.fsproj", "{B11C4E80-DC6E-4143-BB87-866A7F889052}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{B11C4E80-DC6E-4143-BB87-866A7F889052} = {F70658DC-EC3E-4FE0-AF7C-4DF91D88F4AD}
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B11C4E80-DC6E-4143-BB87-866A7F889052}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B11C4E80-DC6E-4143-BB87-866A7F889052}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B11C4E80-DC6E-4143-BB87-866A7F889052}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B11C4E80-DC6E-4143-BB87-866A7F889052}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
