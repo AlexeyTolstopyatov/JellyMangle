@@ -4,147 +4,157 @@ module ItaniumAbiProcessor =
     open System
     
     type MangledDeclType =
-        | MdPrimitive of String
-        | MdObject of List<String> * MangledDeclType // MdType
-        | MdTemplate of MangledDeclType * List<MangledDeclType>
+        | MdPrimitive of string
+        | MdObject of string list * MangledDeclType
+        | MdTemplate of MangledDeclType * MangledDeclType list
         | MdPointer of MangledDeclType
         | MdReference of MangledDeclType
-        | MdImmutable of String * MangledDeclType
+        | MdImmutable of string * MangledDeclType
     
     type ProcedureTemplate = {
-        Namespace: String
-        Class: String
-        Name: String
-        Parameters: List<MangledDeclType>
+        Namespace: string
+        Class: string
+        Name: string
+        Parameters: MangledDeclType list
         Returns: MangledDeclType
-        ImMutable: Boolean
+        ImMutable: bool
     }
-    /// <summary>
-    /// Get Mangled String from charset
-    /// </summary>
-    /// <param name="chars"></param>
-    let getMString (chars: char list) : String * List<Char> =
+    
+    let getMString (chars: char list) : string * char list =
         let rec readDigits acc rest =
             match rest with
-            | c :: tail when Char.IsDigit c  -> readDigits (acc + string c) tail
+            | c :: tail when Char.IsDigit c -> readDigits (acc + string c) tail
             | _ -> (acc, rest)
         
-        let lengthStr, restAfterDigits = readDigits "" chars
-        if String.IsNullOrEmpty lengthStr then
-            failwith "Length null or empty"
-        
-        let length = int lengthStr
-        let name = List.take length restAfterDigits |> Array.ofList |> String
-        
-        (name, List.skip length restAfterDigits)
-    /// <summary>
-    /// 
-    /// </summary>
-    /// <param name="input"></param>
-    let getNestedName (input: char list) : List<String> * List<Char> =
+        match chars with
+        | [] -> failwith "Character sequence is empty"
+        | c :: _ when Char.IsDigit c ->
+            let lengthStr, restAfterDigits = readDigits "" chars
+            if String.IsNullOrEmpty lengthStr then
+                failwith "Length null or empty"
+            
+            let length = int lengthStr
+            if length > restAfterDigits.Length then
+                failwithf $"Length %d{length} exceeds remaining chars %d{restAfterDigits.Length}"
+            
+            let name = restAfterDigits |> List.take length |> Array.ofList |> String
+            (name, List.skip length restAfterDigits)
+        | _ -> failwithf $"Expected digit, got: %A{chars}"
+
+    let getNestedName (input: char list) : string list * char list =
         let rec loop acc rest =
             match rest with
+            | [] -> (List.rev acc, [])
             | 'E' :: tail -> (List.rev acc, tail)
             | _ ->
-                let name, newRest =
-                    getMString rest
-                
-                loop (name :: acc) newRest
+                try
+                    let name, newRest = getMString rest
+                    loop (name :: acc) newRest
+                with _ ->
+                    (List.rev acc, rest)
         loop [] input
         
-    /// <summary>
-    /// Translates parts of declaration
-    /// to language objects
-    /// </summary>
-    /// <param name="decl"></param>
-    let rec getMdDeclType (decl: List<Char>) =
+    let rec getMdDeclType (decl: char list) : MangledDeclType * char list =
         match decl with
+        // Primitives
         | 'v' :: tail -> MdPrimitive "void", tail
         | 'i' :: tail -> MdPrimitive "int", tail
         | 'f' :: tail -> MdPrimitive "float", tail
         | 'd' :: tail -> MdPrimitive "double", tail
         | 'c' :: tail -> MdPrimitive "char", tail
+        // Memory characters
         | 'P' :: tail ->
             let baseType, rest = getMdDeclType tail
             MdPointer baseType, rest
         | 'R' :: tail ->
             let baseType, rest = getMdDeclType tail
             MdReference baseType, rest
+        // C++ la momento
+        | 'N' :: tail ->
+            let names, rest = getNestedName tail
+            // object in the context of types matching
+            // means the c++ coreutils or other entity
+            // in example: std::allocator, std::vector
+            MdObject(names, MdPrimitive "object"), rest
+        // Immutable entry
         | 'K' :: tail ->
             let baseType, rest = getMdDeclType tail
             MdImmutable("const", baseType), rest
-        | 'N' :: tail ->
-            // Shorten variant!!!!
-            let names, rest = getNestedName tail
-            MdObject(names, MdPrimitive "unknown"), rest
-        | _ -> MdPrimitive "unknown", decl
-        
-    /// <summary>
-    /// Reads and matches C++ Template arguments
-    /// </summary>
-    /// <param name="rest"></param>
-    let rec getTemplateArgs (rest: char list) : MangledDeclType list * char list =
-        match rest with
-        | 'I' :: tail -> 
-            let args, remaining = parseTemplateArgs tail
-            (args, remaining)
-        | _ -> failwith "Not a template"
-
-    and parseTemplateArgs (input: char list) : MangledDeclType list * char list =
-        let rec loop acc rest =
-            match rest with
-            | 'E' :: tail -> (List.rev acc, tail)
-            | _ ->
-                let argType, newRest =
-                    getMdDeclType rest
-                
-                loop (argType :: acc) newRest
-        loop [] input
+        | _ -> 
+            // atom in this context means --
+            // this is unknown primitive type, supported by compiler
+            MdPrimitive "atom", List.tail decl
         
     [<CompiledName "DeMangle">]
-    let demangle (input: string) : Option<ProcedureTemplate> =
+    let demangle (input: string) : ProcedureTemplate option =
         let chars = List.ofSeq input
         match chars with
         | '_' :: 'Z' :: rest ->
-            // pre-declared keywords matching
             let isConst, restAfterConst = 
                 match rest with
                 | 'K' :: tail -> (true, tail)
                 | _ -> (false, rest)
             
-            // nested names matching
             let nameParts, restAfterName = 
                 match restAfterConst with
                 | 'N' :: tail -> 
                     let names, remaining = getNestedName tail
                     (names, remaining)
                 | _ -> 
-                    let name, remaining = getMString restAfterConst
-                    ([name], remaining)
+                    try
+                        let name, remaining = getMString restAfterConst
+                        ([name], remaining)
+                    with _ ->
+                        ([], restAfterConst)
             
-            // return types
-            let parameters, returnType, remaining = 
-                let rec parseParams acc rest =
-                    match rest with
-                    | 'E' :: tail -> (List.rev acc, tail)
-                    | _ ->
-                        let param, newRest = getMdDeclType rest
-                        parseParams (param :: acc) newRest
-                let paramsList, afterParams = parseParams [] restAfterName
-                let returnType, remaining = getMdDeclType afterParams
-                (paramsList, returnType, remaining)
+            let parameters, returnType, _remaining = 
+                if restAfterName.IsEmpty then
+                    ([], MdPrimitive "void", [])
+                else
+                    let rec parseParams acc rest depth =
+                        if depth > 100 then
+                            (List.rev acc, MdPrimitive "atom!", rest)
+                        else
+                            match rest with
+                            | [] -> (List.rev acc, MdPrimitive "void", [])
+                            | _ ->
+                                try
+                                    let param, newRest = getMdDeclType rest
+                                    parseParams (param :: acc) newRest (depth + 1)
+                                with ex ->
+                                    (List.rev acc, MdPrimitive "atom", rest)
+                    
+                    let paramsList, afterParams, _depth =
+                        parseParams [] restAfterName 0
+                    
+                    let returnType = 
+                        if paramsList.IsEmpty then 
+                            MdPrimitive "void" 
+                        else 
+                            paramsList |> List.last
+                    
+                    let parameters = 
+                        if paramsList.IsEmpty then [] 
+                        else
+                            paramsList
+                                |> List.take (paramsList.Length - 1)
+                    
+                    (parameters, returnType, [afterParams]) // !
             
-            // namespace::class::method
             let namespaceParts = 
                 if nameParts.Length > 1 then 
-                    nameParts.[0 .. nameParts.Length - 2] 
+                    nameParts[0..nameParts.Length - 2] 
                 else []
+            
             let className = 
                 if nameParts.Length > 1 then 
-                    nameParts.[nameParts.Length - 2] 
-                else ""
+                    nameParts[nameParts.Length - 2] 
+                else
+                    String.Empty
+            
             let funcName = 
-                nameParts.[nameParts.Length - 1]
+                if nameParts.IsEmpty then "no_name" 
+                else nameParts[nameParts.Length - 1]
             
             Some { 
                 Namespace = String.Join("::", namespaceParts)
@@ -152,23 +162,75 @@ module ItaniumAbiProcessor =
                 Name = funcName
                 Parameters = parameters
                 Returns = returnType
-                ImMutable = isConst
+                ImMutable = isConst 
             }
         | _ -> None
     
-    let testNames () = [
-        "_Z3fooiv",
-        "foo(void) -> int",
+    let rec typeToCppDecl (mdType: MangledDeclType) : string =
+        match mdType with
+        | MdPrimitive s -> s
+        | MdObject(path, _) -> String.concat "::" path
+        | MdTemplate(baseType, args) ->
+            let argsStr = args |> List.map typeToCppDecl |> String.concat ", "
+            $"{typeToCppDecl baseType}<{argsStr}>"
+        | MdPointer baseType -> $"{typeToCppDecl baseType}*"
+        | MdReference baseType -> $"{typeToCppDecl baseType}&"
+        | MdImmutable(_, baseType) -> $"const {typeToCppDecl baseType}"
+
+    let getCppDecl (pto: ProcedureTemplate option) : string =
+        match pto with
+        | None -> String.Empty
+        | Some pt ->
         
-        "_ZNK3foo3barEic",
-        "const foo::bar(int, char)",
+        let constQualifier =
+            if pt.ImMutable then
+                "const"
+            else
+                String.Empty
         
-        "_ZNSt6vectorIiSaIiEE5beginEv",
-        "std::vector<int, std::allocator<int>>::begin(void)"
-    ]
+        // building C++ declaration rule
+        // name_space::CEntity::mFunctional
+        let fullName = 
+            [ if not (String.IsNullOrEmpty pt.Namespace) then pt.Namespace
+              if not (String.IsNullOrEmpty pt.Class) then pt.Class
+              pt.Name ]
+            |> List.filter (fun s -> not (String.IsNullOrEmpty s))
+            |> String.concat "::"
+        
+        // Seeking for parameters
+        // mFunctional(...
+        let parameters = 
+            pt.Parameters
+            |> List.map typeToCppDecl
+            |> String.concat ", "
+        
+        // getting return type
+        let returnType = typeToCppDecl pt.Returns
+        
+        // return cppName
+        $"{constQualifier} {returnType} {fullName}({parameters})"
     
     [<EntryPoint>]
-    let main args =
-        demangle "_Z3fooiv"
-            |> printfn "%A"
+    let main _args =
+        let tests = [
+            // C-like functions test done
+            "_Z3fooiv"  // void foo(int)
+            "_Z4fillvPi"// void fill(int*)
+            // problems?
+            "_ZN3std5countPv" // std::count(void*)
+            "_ZN3foo3barEic"  // foo::bar(int, char)
+            // const problems 
+            "_ZN3vec3addRiERv" // const int& vec::add(void&)
+            // total problems
+            "_ZNSt6vectorIiSaIiEE5beginEv"
+            "_Z1fv"
+        ]
+        
+        tests
+            |> List.iter (fun name ->
+                name
+                |> demangle // Option<ProcedureTemplate>
+                |> getCppDecl
+                |> printfn "%s"
+            )
         0
