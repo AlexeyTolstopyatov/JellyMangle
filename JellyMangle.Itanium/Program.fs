@@ -1,5 +1,4 @@
 ﻿namespace JellyMangle.Itanium
-
 module ItaniumAbiProcessor =
     open System
     
@@ -10,6 +9,7 @@ module ItaniumAbiProcessor =
         | MdPointer of MangledDeclType
         | MdReference of MangledDeclType
         | MdImmutable of string * MangledDeclType
+        | MdVolatile of string * MangledDeclType
     
     type ProcedureTemplate = {
         Namespace: string
@@ -18,6 +18,7 @@ module ItaniumAbiProcessor =
         Parameters: MangledDeclType list
         Returns: MangledDeclType
         ImMutable: bool
+        Volatile: bool
     }
     
     let getMString (chars: char list) : string * char list =
@@ -79,41 +80,61 @@ module ItaniumAbiProcessor =
         // Immutable entry
         | 'K' :: tail ->
             let baseType, rest = getMdDeclType tail
-            MdImmutable("const", baseType), rest
-        | _ -> 
+            // for arguments not for functions
+            MdImmutable ("const", baseType), rest
+        | 'V' :: tail ->
+            let baseType, rest = getMdDeclType tail
+            MdVolatile ("volatile", baseType), rest
+        | c -> 
             // atom in this context means --
             // this is unknown primitive type, supported by compiler
-            MdPrimitive "atom", List.tail decl
-        
+            MdPrimitive $"atom::{c}", List.tail decl
+    
+    let parseMethodQualifiers (chars: char list) : bool * bool * char list =
+        let rec loop isConst isVolatile rest =
+            match rest with
+            | 'K' :: tail -> loop true isVolatile tail
+            | 'V' :: tail -> loop isConst true tail
+            | _ -> (isConst, isVolatile, rest)
+        loop false false chars
+    
     [<CompiledName "DeMangle">]
     let demangle (input: string) : ProcedureTemplate option =
         let chars = List.ofSeq input
         match chars with
         | '_' :: 'Z' :: rest ->
-            let isConst, restAfterConst = 
-                match rest with
-                | 'K' :: tail -> (true, tail)
-                | _ -> (false, rest)
-            
             let nameParts, restAfterName = 
-                match restAfterConst with
+                match rest with
                 | 'N' :: tail -> 
                     let names, remaining = getNestedName tail
                     (names, remaining)
                 | _ -> 
                     try
-                        let name, remaining = getMString restAfterConst
+                        let name, remaining = getMString rest
                         ([name], remaining)
                     with _ ->
-                        ([], restAfterConst)
+                        ([], rest)
+                        
+            let parseMethodQualifiers (c: char list) : bool * bool * char list =
+                let rec loop isConst isVolatile rest =
+                    match rest with
+                    | 'K' :: tail -> loop true isVolatile tail
+                    | 'V' :: tail -> loop isConst true tail
+                    | _ -> (isConst, isVolatile, rest)
+                loop false false c
             
-            let parameters, returnType, _remaining = 
-                if restAfterName.IsEmpty then
+            // 
+            // Namespamce and Qualifiers ordering replaced.
+            // broken.
+            let isConst, isVolatile, rem = parseMethodQualifiers restAfterName
+            
+            let parameters, returnType, rem = 
+                if rem.IsEmpty then
                     ([], MdPrimitive "void", [])
                 else
                     let rec parseParams acc rest depth =
                         if depth > 100 then
-                            (List.rev acc, MdPrimitive "atom!", rest)
+                            (List.rev acc, MdPrimitive "arg!", rest) // ! means last primitive from rec
                         else
                             match rest with
                             | [] -> (List.rev acc, MdPrimitive "void", [])
@@ -122,7 +143,7 @@ module ItaniumAbiProcessor =
                                     let param, newRest = getMdDeclType rest
                                     parseParams (param :: acc) newRest (depth + 1)
                                 with ex ->
-                                    (List.rev acc, MdPrimitive "atom", rest)
+                                    (List.rev acc, MdPrimitive "arg", rest)
                     
                     let paramsList, afterParams, _depth =
                         parseParams [] restAfterName 0
@@ -139,7 +160,7 @@ module ItaniumAbiProcessor =
                             paramsList
                                 |> List.take (paramsList.Length - 1)
                     
-                    (parameters, returnType, [afterParams]) // !
+                    (parameters, returnType, [afterParams])
             
             let namespaceParts = 
                 if nameParts.Length > 1 then 
@@ -162,32 +183,35 @@ module ItaniumAbiProcessor =
                 Name = funcName
                 Parameters = parameters
                 Returns = returnType
-                ImMutable = isConst 
+                ImMutable = isConst
+                Volatile = isVolatile
             }
-        | _ -> None
+        | _ ->
+            None
     
     let rec typeToCppDecl (mdType: MangledDeclType) : string =
         match mdType with
         | MdPrimitive s -> s
-        | MdObject(path, _) -> String.concat "::" path
+        | MdObject(path, _) ->
+            String.concat "::" path
         | MdTemplate(baseType, args) ->
             let argsStr = args |> List.map typeToCppDecl |> String.concat ", "
             $"{typeToCppDecl baseType}<{argsStr}>"
         | MdPointer baseType -> $"{typeToCppDecl baseType}*"
         | MdReference baseType -> $"{typeToCppDecl baseType}&"
         | MdImmutable(_, baseType) -> $"const {typeToCppDecl baseType}"
+        | MdVolatile(_, baseType) -> $"volatile {typeToCppDecl baseType}"
 
     let getCppDecl (pto: ProcedureTemplate option) : string =
         match pto with
         | None -> String.Empty
         | Some pt ->
         
-        let constQualifier =
-            if pt.ImMutable then
-                "const"
-            else
-                String.Empty
-        
+        let qualifiers =
+              [ if pt.ImMutable then "const"
+                if pt.Volatile then "volatile" ]
+            |> String.concat " "
+            
         // building C++ declaration rule
         // name_space::CEntity::mFunctional
         let fullName = 
@@ -208,29 +232,28 @@ module ItaniumAbiProcessor =
         let returnType = typeToCppDecl pt.Returns
         
         // return cppName
-        $"{constQualifier} {returnType} {fullName}({parameters})"
+        $"{qualifiers} {returnType} {fullName}({parameters})"
     
     [<EntryPoint>]
     let main _args =
         let tests = [
-            // C-like functions test done
-            "_Z3fooiv"  // void foo(int)
-            "_Z4fillvPi"// void fill(int*)
-            // problems?
-            "_ZN3std5countPv" // std::count(void*)
-            "_ZN3foo3barEic"  // foo::bar(int, char)
-            // const problems 
-            "_ZN3vec3addRiERv" // const int& vec::add(void&)
-            // total problems
-            "_ZNSt6vectorIiSaIiEE5beginEv"
+            "_ZN7CString3newEPc"
+            "_ZNK7MyClass6methodEv" // void ::MyClass::method
+            // // total problems
+            //"_ZNSt6vectorIiSaIiEE5beginEv"
             "_Z1fv"
         ]
         
         tests
             |> List.iter (fun name ->
                 name
-                |> demangle // Option<ProcedureTemplate>
-                |> getCppDecl
-                |> printfn "%s"
+                |> demangle
+                |> printfn "%A"
             )
+        tests
+            |> List.iter (fun f ->
+                f
+                |> demangle
+                |> getCppDecl // namespace=class
+                |> printfn "%s")
         0
