@@ -10,8 +10,11 @@ module ItaniumAbiProcessor =
         | MdReference of MangledDeclType
         | MdImmutable of string * MangledDeclType
         | MdVolatile of string * MangledDeclType
-    
-    type ProcedureTemplate = {
+    /// <summary>
+    /// Declaration syntax tree for C/++
+    /// functions.
+    /// </summary>
+    type CppFunctionDecl = {
         Namespace: string
         Class: string
         Name: string
@@ -55,7 +58,7 @@ module ItaniumAbiProcessor =
                     (List.rev acc, rest)
         loop [] input
         
-    let rec getMdDeclType (decl: char list) : MangledDeclType * char list =
+    let rec findMdDeclType (decl: char list) : MangledDeclType * char list =
         match decl with
         // Primitives
         | 'v' :: tail -> MdPrimitive "void", tail
@@ -65,10 +68,10 @@ module ItaniumAbiProcessor =
         | 'c' :: tail -> MdPrimitive "char", tail
         // Memory characters
         | 'P' :: tail ->
-            let baseType, rest = getMdDeclType tail
+            let baseType, rest = findMdDeclType tail
             MdPointer baseType, rest
         | 'R' :: tail ->
-            let baseType, rest = getMdDeclType tail
+            let baseType, rest = findMdDeclType tail
             MdReference baseType, rest
         // C++ la momento
         | 'N' :: tail ->
@@ -79,18 +82,18 @@ module ItaniumAbiProcessor =
             MdObject(names, MdPrimitive "object"), rest
         // Immutable entry
         | 'K' :: tail ->
-            let baseType, rest = getMdDeclType tail
+            let baseType, rest = findMdDeclType tail
             // for arguments not for functions
             MdImmutable ("const", baseType), rest
         | 'V' :: tail ->
-            let baseType, rest = getMdDeclType tail
+            let baseType, rest = findMdDeclType tail
             MdVolatile ("volatile", baseType), rest
         | c -> 
             // atom in this context means --
             // this is unknown primitive type, supported by compiler
             MdPrimitive $"atom", List.tail decl
     
-    let parseMethodQualifiers (chars: char list) : bool * bool * char list =
+    let findMethodQualifiers (chars: char list) : bool * bool * char list =
         let rec loop isConst isVolatile rest =
             match rest with
             | 'K' :: 'V' :: tail -> loop true true tail  // const volatile
@@ -99,21 +102,51 @@ module ItaniumAbiProcessor =
             | _ -> (isConst, isVolatile, rest)
         loop false false chars
         
+        
+    let swapMethodQualifiers (lst: char list) =
+        if List.contains 'N' lst then
+            
+            let removeFirst x lst =
+                let rec loop acc = function
+                    | [] -> false, List.rev acc
+                    | h :: t when h = x -> true, (List.rev acc) @ t
+                    | h :: t -> loop (h :: acc) t
+                loop [] lst
+
+            let constFound, lst1 = removeFirst 'K' lst
+            let volatileFound, lst2 = removeFirst 'V' lst1
+            
+            let idx = List.findIndex (fun el -> el = 'N') lst2
+            
+            let before = List.take idx lst2
+            let after = List.skip idx lst2
+            
+            let toInsert = 
+                [ if constFound then yield 'K'
+                  if volatileFound then yield 'V' ]
+            
+            before @ toInsert @ after
+        else
+            lst
     
     [<CompiledName "DeMangle">]
-    let demangle (input: string) : ProcedureTemplate option =
-        let chars = List.ofSeq input
+    let demangle (input: string) : CppFunctionDecl option =
+        let chars = input
+                    |> List.ofSeq
+                    |> swapMethodQualifiers
+                    
         match chars with
         | '_' :: 'Z' :: rest ->
             // 1. Qualifiers
             // (const/volatile/virtual)
-            let (isConst, isVolatile, restAfterQualifiers) = parseMethodQualifiers rest
+            let (isConst, isVolatile, restAfterQualifiers) = findMethodQualifiers rest
             
             // 2. Naming
             let nameParts, restAfterName = 
                 match restAfterQualifiers with
-                | 'N' :: tail -> 
+                | 'N' :: tail ->
                     let names, remaining = getNestedName tail
+                    
                     (names, remaining)
                 | _ -> 
                     try
@@ -135,7 +168,7 @@ module ItaniumAbiProcessor =
                             | [] -> (List.rev acc, MdPrimitive "void", [])
                             | _ ->
                                 try
-                                    let param, newRest = getMdDeclType rest
+                                    let param, newRest = findMdDeclType rest
                                     parseParams (param :: acc) newRest (depth + 1)
                                 with ex ->
                                     (List.rev acc, MdPrimitive "arg", rest)
@@ -196,7 +229,7 @@ module ItaniumAbiProcessor =
         | MdImmutable(_, baseType) -> $"const {typeToCppDecl baseType}"
         | MdVolatile(_, baseType) -> $"volatile {typeToCppDecl baseType}"
 
-    let getCppDecl (pto: ProcedureTemplate option) : string =
+    let getCppDecl (pto: CppFunctionDecl option) : string =
         match pto with
         | None -> String.Empty
         | Some pt ->
@@ -229,23 +262,15 @@ module ItaniumAbiProcessor =
         $"{qualifiers} {returnType} {fullName}({parameters})"
     
     [<EntryPoint>]
-    let main _args =
+    let main _args : int =
         let tests = [
-            "_ZN7MyClass6methodEv" // void ::MyClass::method
-            "_ZNK7MyClass6methodEv" // const void ::MyClass::method
-            "_ZNV7MyClass6methodEv" // volatile void ::MyClass::method
-            "_ZNKV7MyClass6methodEv" // const volatile void ::MyClass::method
+            "_ZN7MyClass6methodEiKPiRiv" // void ::MyClass::method [OK]
+            "_ZNK7MyClass6methodEiKPiRiv" // const void ::MyClass::method [OK]
+            "_ZNV7MyClass6methodEiVPiRiv" // volatile void ::MyClass::method [OK]
+            "_ZNKV7MyClass6methodEiViRiv" // const volatile void ::MyClass::method [OK]
             
             //"_ZNSt6vectorIiSaIiEE5beginEv"
-            "_Z1fv"
         ]
-        
-        // tests
-        //     |> List.iter (fun name ->
-        //         name
-        //         |> demangle
-        //         |> printfn "%A"
-        //     )
         tests
             |> List.iter (fun f ->
                 f
