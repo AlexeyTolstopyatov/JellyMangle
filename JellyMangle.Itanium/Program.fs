@@ -57,7 +57,7 @@ module ItaniumAbiProcessor =
                 | 'i' -> NameSub ["std"; "basic_istream"]
                 | 'o' -> NameSub ["std"; "basic_ostream"]
                 | 'd' -> NameSub ["std"; "basic_iostream"]
-                | 't' -> TypeSub (MdObject(["std"], MdPrimitive "std"))
+                | 't' -> NameSub ["std"]
                 | _ -> NameSub ["std_" + string code]
             
             let newState = { 
@@ -100,8 +100,7 @@ module ItaniumAbiProcessor =
             | 'S' :: code :: tail -> 
                 match resolveSubstitution code currentState with
                 | Some (NameSub names), newState ->
-                    // extract names before add
-                    loop (List.rev names @ acc) newState tail
+                    loop (acc @ (List.rev names)) newState tail
                 | _ ->
                     loop ($"::{code}" :: acc) currentState tail
             | 'E' :: tail -> 
@@ -386,8 +385,9 @@ module ItaniumAbiProcessor =
     let main _args : int =
         let tests = [
             "_Z5stateRic"
-            "_ZNSt3_In4wardE"
-            "_ZN2ns3fooIS0_IiEEEv"
+            "_ZNSt3_In4wardEIiEv"
+            "_ZN1N1TIiiE2mfES0_IddE"
+            "_Z1fIiEvPiPT_S2_"
         ]
         tests
             |> List.iter (fun f ->
