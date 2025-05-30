@@ -1,7 +1,10 @@
 ﻿namespace JellyMangle.Itanium
 module ItaniumAbiProcessor =
     open System
-    
+    /// <summary>
+    /// Describes all available syntax parts
+    /// of C/++ functions declaration.
+    /// </summary>
     type MangledDeclType =
         | MdPrimitive of string
         | MdObject of string list * MangledDeclType
@@ -10,8 +13,12 @@ module ItaniumAbiProcessor =
         | MdReference of MangledDeclType
         | MdImmutable of string * MangledDeclType
         | MdVolatile of string * MangledDeclType
+        
+    type MangledSubstitutionType = {
+        
+    }
     /// <summary>
-    /// Declaration syntax tree for C/++
+    /// Declaration syntax parts for C/++
     /// functions.
     /// </summary>
     type CppFunctionDecl = {
@@ -23,7 +30,11 @@ module ItaniumAbiProcessor =
         ImMutable: bool
         Volatile: bool
     }
-    
+    /// <summary>
+    /// Matches and returns expected ASCII string
+    /// with other function's bytes
+    /// </summary>
+    /// <param name="chars">function's bytes</param>
     let getMString (chars: char list) : string * char list =
         let rec readDigits acc rest =
             match rest with
@@ -44,7 +55,10 @@ module ItaniumAbiProcessor =
             let name = restAfterDigits |> List.take length |> Array.ofList |> String
             (name, List.skip length restAfterDigits)
         | _ -> failwithf $"Expected digit, got: %A{chars}"
-
+    /// <summary>
+    /// Returns namespace word of required function
+    /// </summary>
+    /// <param name="input">function's bytes</param>
     let getNestedName (input: char list) : string list * char list =
         let rec loop acc rest =
             match rest with
@@ -57,7 +71,11 @@ module ItaniumAbiProcessor =
                 with _ ->
                     (List.rev acc, rest)
         loop [] input
-        
+    /// <summary>
+    /// Matches type of syntax part and translate it
+    /// on C/++ syntax
+    /// </summary>
+    /// <param name="decl">function's bytes</param>
     let rec findMdDeclType (decl: char list) : MangledDeclType * char list =
         match decl with
         // Primitives
@@ -73,7 +91,7 @@ module ItaniumAbiProcessor =
         | 'R' :: tail ->
             let baseType, rest = findMdDeclType tail
             MdReference baseType, rest
-        // C++ la momento
+        // C++ moment
         | 'N' :: tail ->
             let names, rest = getNestedName tail
             // object in the context of types matching
@@ -88,11 +106,15 @@ module ItaniumAbiProcessor =
         | 'V' :: tail ->
             let baseType, rest = findMdDeclType tail
             MdVolatile ("volatile", baseType), rest
-        | c -> 
+        | _ -> 
             // atom in this context means --
             // this is unknown primitive type, supported by compiler
-            MdPrimitive $"atom", List.tail decl
-    
+            MdPrimitive "atom", List.tail decl
+    /// <summary>
+    /// Matches and points which function's qualifiers
+    /// are available 
+    /// </summary>
+    /// <param name="chars">function's bytes</param>
     let findMethodQualifiers (chars: char list) : bool * bool * char list =
         let rec loop isConst isVolatile rest =
             match rest with
@@ -101,8 +123,11 @@ module ItaniumAbiProcessor =
             | 'V' :: tail -> loop isConst true tail      // volatile
             | _ -> (isConst, isVolatile, rest)
         loop false false chars
-        
-        
+    /// <summary>
+    /// Matches and Replaces function's qualifiers
+    /// for next recognition
+    /// </summary>
+    /// <param name="lst">function's bytes</param>
     let swapMethodQualifiers (lst: char list) =
         if List.contains 'N' lst then
             
@@ -128,7 +153,13 @@ module ItaniumAbiProcessor =
             before @ toInsert @ after
         else
             lst
-    
+    /// <summary>
+    /// Translates mangled C/++ function string
+    /// to <see cref="CppFunctionDecl"/> struct.
+    /// If you need translate <see cref="CppFunctionDecl"/> to
+    /// ready C/++ function's prototype - use <see cref="getCppDecl"/>
+    /// </summary>
+    /// <param name="input">Expected Mangled Itanium ABI prototype string</param>
     [<CompiledName "DeMangle">]
     let demangle (input: string) : CppFunctionDecl option =
         let chars = input
@@ -139,7 +170,7 @@ module ItaniumAbiProcessor =
         | '_' :: 'Z' :: rest ->
             // 1. Qualifiers
             // (const/volatile/virtual)
-            let (isConst, isVolatile, restAfterQualifiers) = findMethodQualifiers rest
+            let isConst, isVolatile, restAfterQualifiers = findMethodQualifiers rest
             
             // 2. Naming
             let nameParts, restAfterName = 
@@ -156,7 +187,7 @@ module ItaniumAbiProcessor =
                         ([], restAfterQualifiers)
             
             // 3. Args / return
-            let parameters, returnType, remaining = 
+            let parameters, returnType, _remaining = 
                 if restAfterName.IsEmpty then
                     ([], MdPrimitive "void", [])
                 else
@@ -213,7 +244,11 @@ module ItaniumAbiProcessor =
                 Volatile = isVolatile
             }
         | _ -> None
-    
+    /// <summary>
+    /// Translates parts of syntax to strings
+    /// of C/++ parts of function's prototype
+    /// </summary>
+    /// <param name="mdType">Part of <see cref="CppFunctionDecl"/></param>
     let rec typeToCppDecl (mdType: MangledDeclType) : string =
         match mdType with
         | MdPrimitive s -> s
@@ -228,7 +263,11 @@ module ItaniumAbiProcessor =
         | MdReference baseType -> $"{typeToCppDecl baseType}&"
         | MdImmutable(_, baseType) -> $"const {typeToCppDecl baseType}"
         | MdVolatile(_, baseType) -> $"volatile {typeToCppDecl baseType}"
-
+    /// <summary>
+    /// Translates structure of recognized Itanium ABI
+    /// function to declaration string
+    /// </summary>
+    /// <param name="pto"><see cref="Option[CppFunctionDecl]"/></param>
     let getCppDecl (pto: CppFunctionDecl option) : string =
         match pto with
         | None -> String.Empty
@@ -264,12 +303,12 @@ module ItaniumAbiProcessor =
     [<EntryPoint>]
     let main _args : int =
         let tests = [
-            "_ZN7MyClass6methodEiKPiRiv" // void ::MyClass::method [OK]
-            "_ZNK7MyClass6methodEiKPiRiv" // const void ::MyClass::method [OK]
-            "_ZNV7MyClass6methodEiVPiRiv" // volatile void ::MyClass::method [OK]
-            "_ZNKV7MyClass6methodEiViRiv" // const volatile void ::MyClass::method [OK]
-            
-            //"_ZNSt6vectorIiSaIiEE5beginEv"
+            "_ZN7MyClass6methodEiKPiRiv"
+            "_ZNK7MyClass6methodEiKPiRiv"
+            "_ZNV7MyClass6methodEiVPiRiv"
+            "_ZNKV7MyClass6methodEiViRiv"
+            // C++ templates usage
+            // "_ZNSt6vectorIiSaIiEE5beginEv" // substitutions needed. template matching needed
         ]
         tests
             |> List.iter (fun f ->
