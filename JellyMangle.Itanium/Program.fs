@@ -40,7 +40,7 @@ module ItaniumAbiProcessor =
         Volatile: bool
         Virtual: bool
     }
-    let resolveSubstitution (code: char) (state: ParseState) : Substitution option * ParseState =
+    let rec resolveSubstitution (code: char) (state: ParseState) : Substitution option * ParseState =
         if Char.IsDigit code then
             let index = int (string code)
             if index < state.Substitutions.Length then
@@ -57,10 +57,9 @@ module ItaniumAbiProcessor =
                 | 'i' -> NameSub ["std"; "basic_istream"]
                 | 'o' -> NameSub ["std"; "basic_ostream"]
                 | 'd' -> NameSub ["std"; "basic_iostream"]
-                | 't' -> TypeSub (MdObject(["std"], MdPrimitive "allocator"))
-                | _ -> NameSub ["std_subst_" + string code]
+                | 't' -> TypeSub (MdObject(["std"], MdPrimitive "std"))
+                | _ -> NameSub ["std_" + string code]
             
-            // Добавляем новую подстановку в начало списка
             let newState = { 
                 state with Substitutions = newSubst :: state.Substitutions 
             }
@@ -103,19 +102,19 @@ module ItaniumAbiProcessor =
                 | Some (NameSub names), newState ->
                     // extract names before add
                     loop (List.rev names @ acc) newState tail
-                | _ -> 
-                    loop ($"subst{code}" :: acc) currentState tail
+                | _ ->
+                    loop ($"::{code}" :: acc) currentState tail
             | 'E' :: tail -> 
                 (List.rev acc, tail, currentState)
             | _ ->
                 match rest with
                 | c :: _ when Char.IsDigit(c) ->
-                    let name, newRest = getMString rest
+                    let name, r = getMString rest
                     let newFullName = (List.rev acc) @ [name]
-                    let newState = { 
+                    let s = { 
                         currentState with Substitutions = [NameSub [name]; NameSub newFullName] @ currentState.Substitutions 
                     }
-                    loop (name :: acc) newState newRest
+                    loop (name :: acc) s r
                 | _ -> 
                     (List.rev acc, rest, currentState)
         loop [] state input
@@ -132,7 +131,7 @@ module ItaniumAbiProcessor =
             | Some (TypeSub t), newState -> 
                 (t, tail, newState)
             | _ -> 
-                (MdPrimitive $"subst{code}", tail, state)
+                (MdPrimitive $"::S{code}", tail, state)
         // Primitives
         | 'v' :: tail -> MdPrimitive "void", tail, state
         | 'w' :: tail -> MdPrimitive "wchar_t", tail, state
@@ -162,14 +161,14 @@ module ItaniumAbiProcessor =
                     match rest with
                     | 'E' :: tail -> (List.rev acc, tail, state)
                     | 'I' :: tail -> // template in template
-                        let (nestedArgs, afterNested, newState) = parseTemplateArgs [] tail state (depth + 1)
+                        let nestedArgs, afterNested, newState = parseTemplateArgs [] tail state (depth + 1)
                         let nestedTemplate = MdTemplate(MdPrimitive "nested", nestedArgs)
                         parseTemplateArgs (nestedTemplate :: acc) afterNested newState depth
                     | _ ->
                         let argType, newRest, newState = findMdDeclType (rest, state)
                         parseTemplateArgs (argType :: acc) newRest newState depth
                         
-            let templateArgs, afterTemplate, s = parseTemplateArgs [] tail state
+            let templateArgs, afterTemplate, s = parseTemplateArgs [] tail state 0
             
             let baseType =
                 match templateArgs with
@@ -227,7 +226,7 @@ module ItaniumAbiProcessor =
 
             let constFound, lst1 = removeFirst 'K' lst
             let volatileFound, lst2 = removeFirst 'V' lst1
-            let virtualFound, lst3 = removeFirst 'G' lst1
+            let virtualFound, _lst3 = removeFirst 'G' lst1
             
             let idx = List.findIndex (fun el -> el = 'N') lst2
             
@@ -334,7 +333,7 @@ module ItaniumAbiProcessor =
         match mdType with
         | MdPrimitive s -> s
         | MdObject(path, _) ->
-            String.concat "::" path
+            String.concat "" path //
         | MdTemplate(baseType, args) ->
             let argsStr = args
                           |> List.map typeToCppDecl
@@ -365,7 +364,7 @@ module ItaniumAbiProcessor =
         // name_space::CEntity::mFunctional
         let fullName = 
             [ if not (String.IsNullOrEmpty pt.Namespace) then pt.Namespace
-              if not (String.IsNullOrEmpty pt.Class) then pt.Class
+              // if not (String.IsNullOrEmpty pt.Class) then pt.Class
               pt.Name ]
             |> List.filter (fun s -> not (String.IsNullOrEmpty s))
             |> String.concat "::"
@@ -386,19 +385,14 @@ module ItaniumAbiProcessor =
     [<EntryPoint>]
     let main _args : int =
         let tests = [
-            // "_ZN7MyClass6methodEiKPiRiv"
-            // "_ZNK7MyClass6methodEiKPiRiv"
-            // "_ZNV7MyClass6methodEiVPiRiv"
-            // "_ZNKV7MyClass6methodEiViRiv"
-            //"_ZN3std6vectorISt6stringSaIS1_EE5beginEv"
-            "_ZN2ns3fooS0_IiEEv"
-            //"_ZNSbIwSt11char_traitsIwESaIwEEC1Ev"
-            //"_ZNSt6vectorIiSaIiEE5beginEv" // substitutions needed. template matching needed
+            "_Z5stateRic"
+            "_ZNSt3_In4wardE"
+            "_ZN2ns3fooIS0_IiEEEv"
         ]
         tests
             |> List.iter (fun f ->
                 f
                 |> demangle
-                //|> getCppDecl // namespace=class
+                |> getCppDecl // namespace=class
                 |> printfn "%A")
         0
