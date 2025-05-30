@@ -88,53 +88,48 @@ module ItaniumAbiProcessor =
         | c -> 
             // atom in this context means --
             // this is unknown primitive type, supported by compiler
-            MdPrimitive $"atom::{c}", List.tail decl
+            MdPrimitive $"atom", List.tail decl
     
     let parseMethodQualifiers (chars: char list) : bool * bool * char list =
         let rec loop isConst isVolatile rest =
             match rest with
-            | 'K' :: tail -> loop true isVolatile tail
-            | 'V' :: tail -> loop isConst true tail
+            | 'K' :: 'V' :: tail -> loop true true tail  // const volatile
+            | 'K' :: tail -> loop true isVolatile tail   // const
+            | 'V' :: tail -> loop isConst true tail      // volatile
             | _ -> (isConst, isVolatile, rest)
         loop false false chars
+        
     
     [<CompiledName "DeMangle">]
     let demangle (input: string) : ProcedureTemplate option =
         let chars = List.ofSeq input
         match chars with
         | '_' :: 'Z' :: rest ->
+            // 1. Qualifiers
+            // (const/volatile/virtual)
+            let (isConst, isVolatile, restAfterQualifiers) = parseMethodQualifiers rest
+            
+            // 2. Naming
             let nameParts, restAfterName = 
-                match rest with
+                match restAfterQualifiers with
                 | 'N' :: tail -> 
                     let names, remaining = getNestedName tail
                     (names, remaining)
                 | _ -> 
                     try
-                        let name, remaining = getMString rest
+                        let name, remaining = getMString restAfterQualifiers
                         ([name], remaining)
                     with _ ->
-                        ([], rest)
-                        
-            let parseMethodQualifiers (c: char list) : bool * bool * char list =
-                let rec loop isConst isVolatile rest =
-                    match rest with
-                    | 'K' :: tail -> loop true isVolatile tail
-                    | 'V' :: tail -> loop isConst true tail
-                    | _ -> (isConst, isVolatile, rest)
-                loop false false c
+                        ([], restAfterQualifiers)
             
-            // 
-            // Namespamce and Qualifiers ordering replaced.
-            // broken.
-            let isConst, isVolatile, rem = parseMethodQualifiers restAfterName
-            
-            let parameters, returnType, rem = 
-                if rem.IsEmpty then
+            // 3. Args / return
+            let parameters, returnType, remaining = 
+                if restAfterName.IsEmpty then
                     ([], MdPrimitive "void", [])
                 else
                     let rec parseParams acc rest depth =
                         if depth > 100 then
-                            (List.rev acc, MdPrimitive "arg!", rest) // ! means last primitive from rec
+                            (List.rev acc, MdPrimitive "arg!", rest)
                         else
                             match rest with
                             | [] -> (List.rev acc, MdPrimitive "void", [])
@@ -145,9 +140,9 @@ module ItaniumAbiProcessor =
                                 with ex ->
                                     (List.rev acc, MdPrimitive "arg", rest)
                     
-                    let paramsList, afterParams, _depth =
+                    let paramsList, afterParams, _depth = 
                         parseParams [] restAfterName 0
-                    
+                        
                     let returnType = 
                         if paramsList.IsEmpty then 
                             MdPrimitive "void" 
@@ -157,11 +152,10 @@ module ItaniumAbiProcessor =
                     let parameters = 
                         if paramsList.IsEmpty then [] 
                         else
-                            paramsList
-                                |> List.take (paramsList.Length - 1)
+                            paramsList |> List.take (paramsList.Length - 1)
                     
                     (parameters, returnType, [afterParams])
-            
+                    
             let namespaceParts = 
                 if nameParts.Length > 1 then 
                     nameParts[0..nameParts.Length - 2] 
@@ -170,11 +164,10 @@ module ItaniumAbiProcessor =
             let className = 
                 if nameParts.Length > 1 then 
                     nameParts[nameParts.Length - 2] 
-                else
-                    String.Empty
+                else String.Empty
             
             let funcName = 
-                if nameParts.IsEmpty then "no_name" 
+                if nameParts.IsEmpty then "__no_name" 
                 else nameParts[nameParts.Length - 1]
             
             Some { 
@@ -186,8 +179,7 @@ module ItaniumAbiProcessor =
                 ImMutable = isConst
                 Volatile = isVolatile
             }
-        | _ ->
-            None
+        | _ -> None
     
     let rec typeToCppDecl (mdType: MangledDeclType) : string =
         match mdType with
@@ -195,7 +187,9 @@ module ItaniumAbiProcessor =
         | MdObject(path, _) ->
             String.concat "::" path
         | MdTemplate(baseType, args) ->
-            let argsStr = args |> List.map typeToCppDecl |> String.concat ", "
+            let argsStr = args
+                          |> List.map typeToCppDecl
+                          |> String.concat ", "
             $"{typeToCppDecl baseType}<{argsStr}>"
         | MdPointer baseType -> $"{typeToCppDecl baseType}*"
         | MdReference baseType -> $"{typeToCppDecl baseType}&"
@@ -237,19 +231,21 @@ module ItaniumAbiProcessor =
     [<EntryPoint>]
     let main _args =
         let tests = [
-            "_ZN7CString3newEPc"
-            "_ZNK7MyClass6methodEv" // void ::MyClass::method
-            // // total problems
+            "_ZN7MyClass6methodEv" // void ::MyClass::method
+            "_ZNK7MyClass6methodEv" // const void ::MyClass::method
+            "_ZNV7MyClass6methodEv" // volatile void ::MyClass::method
+            "_ZNKV7MyClass6methodEv" // const volatile void ::MyClass::method
+            
             //"_ZNSt6vectorIiSaIiEE5beginEv"
             "_Z1fv"
         ]
         
-        tests
-            |> List.iter (fun name ->
-                name
-                |> demangle
-                |> printfn "%A"
-            )
+        // tests
+        //     |> List.iter (fun name ->
+        //         name
+        //         |> demangle
+        //         |> printfn "%A"
+        //     )
         tests
             |> List.iter (fun f ->
                 f
