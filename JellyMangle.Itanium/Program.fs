@@ -13,9 +13,18 @@ module ItaniumAbiProcessor =
         | MdReference of MangledDeclType
         | MdImmutable of string * MangledDeclType
         | MdVolatile of string * MangledDeclType
-        
-    type MangledSubstitutionType = {
-        
+        | MdVirtual of string * MangledDeclType
+    /// <summary>
+    /// Itanium ABI substitution type
+    /// </summary>
+    type Substitution =
+        | NameSub of string list   // Для имён: ["ns"; "foo"]
+        | TypeSub of MangledDeclType  // Для типов: MdObject(...)
+    /// <summary>
+    /// Storage of substitutions
+    /// </summary>
+    type ParseState = {
+        Substitutions: Substitution list
     }
     /// <summary>
     /// Declaration syntax parts for C/++
@@ -29,7 +38,33 @@ module ItaniumAbiProcessor =
         Returns: MangledDeclType
         ImMutable: bool
         Volatile: bool
+        Virtual: bool
     }
+    let resolveSubstitution (code: char) (state: ParseState) : Substitution option * ParseState =
+        if Char.IsDigit code then
+            let index = int (string code)
+            if index < state.Substitutions.Length then
+                let subst = state.Substitutions[index]
+                (Some subst, state)
+            else
+                (None, state)
+        else
+            let newSubst = 
+                match code with
+                | 'a' -> NameSub ["std"; "allocator"]
+                | 'b' -> NameSub ["std"; "basic_string"]
+                | 's' -> NameSub ["std"; "string"]
+                | 'i' -> NameSub ["std"; "basic_istream"]
+                | 'o' -> NameSub ["std"; "basic_ostream"]
+                | 'd' -> NameSub ["std"; "basic_iostream"]
+                | 't' -> TypeSub (MdObject(["std"], MdPrimitive "allocator"))
+                | _ -> NameSub ["std_subst_" + string code]
+            
+            // Добавляем новую подстановку в начало списка
+            let newState = { 
+                state with Substitutions = newSubst :: state.Substitutions 
+            }
+            (Some newSubst, newState)
     /// <summary>
     /// Matches and returns expected ASCII string
     /// with other function's bytes
@@ -59,70 +94,122 @@ module ItaniumAbiProcessor =
     /// Returns namespace word of required function
     /// </summary>
     /// <param name="input">function's bytes</param>
-    let getNestedName (input: char list) : string list * char list =
-        let rec loop acc rest =
+    /// <param name="state">substitution state</param>
+    let getNestedName (input: char list, state: ParseState) : string list * char list * ParseState =
+        let rec loop acc currentState rest =
             match rest with
-            | [] -> (List.rev acc, [])
-            | 'E' :: tail -> (List.rev acc, tail)
+            | 'S' :: code :: tail -> 
+                match resolveSubstitution code currentState with
+                | Some (NameSub names), newState ->
+                    // extract names before add
+                    loop (List.rev names @ acc) newState tail
+                | _ -> 
+                    loop ($"subst{code}" :: acc) currentState tail
+            | 'E' :: tail -> 
+                (List.rev acc, tail, currentState)
             | _ ->
-                try
+                match rest with
+                | c :: _ when Char.IsDigit(c) ->
                     let name, newRest = getMString rest
-                    loop (name :: acc) newRest
-                with _ ->
-                    (List.rev acc, rest)
-        loop [] input
+                    let newFullName = (List.rev acc) @ [name]
+                    let newState = { 
+                        currentState with Substitutions = [NameSub [name]; NameSub newFullName] @ currentState.Substitutions 
+                    }
+                    loop (name :: acc) newState newRest
+                | _ -> 
+                    (List.rev acc, rest, currentState)
+        loop [] state input
     /// <summary>
     /// Matches type of syntax part and translate it
     /// on C/++ syntax
     /// </summary>
     /// <param name="decl">function's bytes</param>
-    let rec findMdDeclType (decl: char list) : MangledDeclType * char list =
+    /// <param name="state">substitution state</param>
+    let rec findMdDeclType (decl: char list, state: ParseState) : MangledDeclType * char list * ParseState =
         match decl with
+        | 'S' :: code :: tail ->
+            match resolveSubstitution code state with
+            | Some (TypeSub t), newState -> 
+                (t, tail, newState)
+            | _ -> 
+                (MdPrimitive $"subst{code}", tail, state)
         // Primitives
-        | 'v' :: tail -> MdPrimitive "void", tail
-        | 'i' :: tail -> MdPrimitive "int", tail
-        | 'f' :: tail -> MdPrimitive "float", tail
-        | 'd' :: tail -> MdPrimitive "double", tail
-        | 'c' :: tail -> MdPrimitive "char", tail
+        | 'v' :: tail -> MdPrimitive "void", tail, state
+        | 'w' :: tail -> MdPrimitive "wchar_t", tail, state
+        | 'c' :: tail -> MdPrimitive "char", tail, state
+        | 'i' :: tail -> MdPrimitive "int", tail, state
+        | 'f' :: tail -> MdPrimitive "float", tail, state
+        | 'd' :: tail -> MdPrimitive "double", tail, state
+        | 'l' :: tail -> MdPrimitive "long", tail, state
         // Memory characters
         | 'P' :: tail ->
-            let baseType, rest = findMdDeclType tail
-            MdPointer baseType, rest
+            let baseType, rest, s = findMdDeclType (tail, state)
+            (MdPointer baseType, rest, s)
         | 'R' :: tail ->
-            let baseType, rest = findMdDeclType tail
-            MdReference baseType, rest
+            let baseType, rest, s = findMdDeclType (tail, state)
+            (MdReference baseType, rest, s)
         // C++ moment
         | 'N' :: tail ->
-            let names, rest = getNestedName tail
+            let names, rest, s = getNestedName (tail, state)
             // object in the context of types matching
             // means the c++ coreutils or other entity
             // in example: std::allocator, std::vector
-            MdObject(names, MdPrimitive "object"), rest
+            MdObject (names, MdPrimitive "object"), rest, s
+        | 'I' :: tail -> // 'Template<...'
+            let rec parseTemplateArgs acc rest state depth =
+                if depth > 10 then (List.rev acc, rest, state) // rec limit
+                else
+                    match rest with
+                    | 'E' :: tail -> (List.rev acc, tail, state)
+                    | 'I' :: tail -> // template in template
+                        let (nestedArgs, afterNested, newState) = parseTemplateArgs [] tail state (depth + 1)
+                        let nestedTemplate = MdTemplate(MdPrimitive "nested", nestedArgs)
+                        parseTemplateArgs (nestedTemplate :: acc) afterNested newState depth
+                    | _ ->
+                        let argType, newRest, newState = findMdDeclType (rest, state)
+                        parseTemplateArgs (argType :: acc) newRest newState depth
+                        
+            let templateArgs, afterTemplate, s = parseTemplateArgs [] tail state
+            
+            let baseType =
+                match templateArgs with
+                | [] -> MdPrimitive "unknown_template"
+                | h :: _ -> h
+        
+            (MdTemplate(baseType, templateArgs), afterTemplate, s)
         // Immutable entry
         | 'K' :: tail ->
-            let baseType, rest = findMdDeclType tail
+            let baseType, rest, s = findMdDeclType(tail, state)
             // for arguments not for functions
-            MdImmutable ("const", baseType), rest
+            MdImmutable ("const", baseType), rest, s
         | 'V' :: tail ->
-            let baseType, rest = findMdDeclType tail
-            MdVolatile ("volatile", baseType), rest
+            let baseType, rest, s = findMdDeclType (tail, state)
+            MdVolatile ("volatile", baseType), rest, s
+        | 'G' :: tail ->
+            let baseType, rest, s = findMdDeclType (tail, state)
+            MdVirtual ("virtual", baseType), rest, s
         | _ -> 
             // atom in this context means --
             // this is unknown primitive type, supported by compiler
-            MdPrimitive "atom", List.tail decl
+            MdPrimitive "atom", List.tail decl, state
     /// <summary>
     /// Matches and points which function's qualifiers
     /// are available 
     /// </summary>
     /// <param name="chars">function's bytes</param>
-    let findMethodQualifiers (chars: char list) : bool * bool * char list =
-        let rec loop isConst isVolatile rest =
+    let findMethodQualifiers (chars: char list) : bool * bool * bool * char list =
+        let rec loop isConst isVolatile isVirtual rest =
             match rest with
-            | 'K' :: 'V' :: tail -> loop true true tail  // const volatile
-            | 'K' :: tail -> loop true isVolatile tail   // const
-            | 'V' :: tail -> loop isConst true tail      // volatile
-            | _ -> (isConst, isVolatile, rest)
-        loop false false chars
+            | 'K' :: 'V' :: 'G' :: tail -> loop true true true tail
+            | 'K' :: 'V' :: tail -> loop true true isVolatile tail
+            | 'K' :: 'G' :: tail -> loop true true isVirtual tail
+            | 'V' :: 'G' :: tail -> loop isConst true true tail
+            | 'K' :: tail -> loop true isVolatile isVirtual tail 
+            | 'V' :: tail -> loop isConst true isVirtual tail
+            | 'G' :: tail -> loop isConst isVolatile true tail
+            | _ -> (isConst, isVolatile, isVirtual, rest)
+            
+        loop false false false chars
     /// <summary>
     /// Matches and Replaces function's qualifiers
     /// for next recognition
@@ -140,15 +227,18 @@ module ItaniumAbiProcessor =
 
             let constFound, lst1 = removeFirst 'K' lst
             let volatileFound, lst2 = removeFirst 'V' lst1
+            let virtualFound, lst3 = removeFirst 'G' lst1
             
             let idx = List.findIndex (fun el -> el = 'N') lst2
             
             let before = List.take idx lst2
             let after = List.skip idx lst2
             
+            
             let toInsert = 
                 [ if constFound then yield 'K'
-                  if volatileFound then yield 'V' ]
+                  if volatileFound then yield 'V'
+                  if virtualFound then yield 'G']
             
             before @ toInsert @ after
         else
@@ -164,86 +254,77 @@ module ItaniumAbiProcessor =
     let demangle (input: string) : CppFunctionDecl option =
         let chars = input
                     |> List.ofSeq
-                    |> swapMethodQualifiers
-                    
+                    |> swapMethodQualifiers    
+        
         match chars with
-        | '_' :: 'Z' :: rest ->
-            // 1. Qualifiers
-            // (const/volatile/virtual)
-            let isConst, isVolatile, restAfterQualifiers = findMethodQualifiers rest
-            
-            // 2. Naming
-            let nameParts, restAfterName = 
-                match restAfterQualifiers with
-                | 'N' :: tail ->
-                    let names, remaining = getNestedName tail
-                    
-                    (names, remaining)
-                | _ -> 
-                    try
-                        let name, remaining = getMString restAfterQualifiers
-                        ([name], remaining)
-                    with _ ->
-                        ([], restAfterQualifiers)
-            
-            // 3. Args / return
-            let parameters, returnType, _remaining = 
-                if restAfterName.IsEmpty then
-                    ([], MdPrimitive "void", [])
-                else
-                    let rec parseParams acc rest depth =
-                        if depth > 100 then
-                            (List.rev acc, MdPrimitive "arg!", rest)
-                        else
-                            match rest with
-                            | [] -> (List.rev acc, MdPrimitive "void", [])
-                            | _ ->
-                                try
-                                    let param, newRest = findMdDeclType rest
-                                    parseParams (param :: acc) newRest (depth + 1)
-                                with ex ->
-                                    (List.rev acc, MdPrimitive "arg", rest)
-                    
-                    let paramsList, afterParams, _depth = 
-                        parseParams [] restAfterName 0
+            | '_' :: 'Z' :: rest ->
+                let isConst, isVolatile, isVirtual, restAfterQualifiers = findMethodQualifiers rest
+                let initState = { Substitutions = [] }
+                
+                let nameParts, restAfterName, nameState = 
+                    match restAfterQualifiers with
+                    | 'N' :: tail ->
+                        getNestedName (tail, initState)
+                    | _ -> 
+                        try
+                            let name, remaining = getMString restAfterQualifiers
+                            ([name], remaining, initState)
+                        with _ ->
+                            ([], restAfterQualifiers, initState)
+                
+                let rec parseParams acc rest depth state =
+                    if depth > 100 then (List.rev acc, MdPrimitive "arg!", rest, state)
+                    else
+                        match rest with
+                        | [] -> (List.rev acc, MdPrimitive "void", [], state)
+                        | _ ->
+                            try
+                                let param, newRest, newState = findMdDeclType (rest, state)
+                                parseParams (param :: acc) newRest (depth + 1) newState
+                            with ex ->
+                                (List.rev acc, MdPrimitive "arg", rest, state)
+                
+                let paramsList, returnType, remaining, _ = 
+                    parseParams [] restAfterName 0 nameState
                         
-                    let returnType = 
-                        if paramsList.IsEmpty then 
-                            MdPrimitive "void" 
-                        else 
-                            paramsList |> List.last
+                let returnType = 
+                    if paramsList.IsEmpty then 
+                        MdPrimitive "void" 
+                    else 
+                        paramsList
+                            |> List.last
+                
+                let parameters = 
+                    if paramsList.IsEmpty then [] 
+                    else
+                        paramsList
+                            |> List.take (paramsList.Length - 1)
                     
-                    let parameters = 
-                        if paramsList.IsEmpty then [] 
-                        else
-                            paramsList |> List.take (paramsList.Length - 1)
-                    
-                    (parameters, returnType, [afterParams])
-                    
-            let namespaceParts = 
-                if nameParts.Length > 1 then 
-                    nameParts[0..nameParts.Length - 2] 
-                else []
-            
-            let className = 
-                if nameParts.Length > 1 then 
-                    nameParts[nameParts.Length - 2] 
-                else String.Empty
-            
-            let funcName = 
-                if nameParts.IsEmpty then "__no_name" 
-                else nameParts[nameParts.Length - 1]
-            
-            Some { 
-                Namespace = String.Join("::", namespaceParts)
-                Class = className
-                Name = funcName
-                Parameters = parameters
-                Returns = returnType
-                ImMutable = isConst
-                Volatile = isVolatile
-            }
-        | _ -> None
+                let namespaceParts = 
+                    if nameParts.Length > 1 then 
+                        nameParts[0..nameParts.Length - 2] 
+                    else []
+                
+                let className = 
+                    if nameParts.Length > 1 then 
+                        nameParts[nameParts.Length - 2] 
+                    else String.Empty
+                
+                let funcName = 
+                    if nameParts.IsEmpty then "__no_name" 
+                    else nameParts[nameParts.Length - 1]
+                
+                Some { 
+                    Namespace = String.Join("::", namespaceParts)
+                    Class = className
+                    Name = funcName
+                    Parameters = parameters
+                    Returns = returnType
+                    ImMutable = isConst
+                    Volatile = isVolatile
+                    Virtual = isVirtual 
+                }
+            | _ -> None
     /// <summary>
     /// Translates parts of syntax to strings
     /// of C/++ parts of function's prototype
@@ -263,6 +344,7 @@ module ItaniumAbiProcessor =
         | MdReference baseType -> $"{typeToCppDecl baseType}&"
         | MdImmutable(_, baseType) -> $"const {typeToCppDecl baseType}"
         | MdVolatile(_, baseType) -> $"volatile {typeToCppDecl baseType}"
+        | MdVirtual(_, baseType) -> $"virtual {typeToCppDecl baseType}"
     /// <summary>
     /// Translates structure of recognized Itanium ABI
     /// function to declaration string
@@ -275,7 +357,8 @@ module ItaniumAbiProcessor =
         
         let qualifiers =
               [ if pt.ImMutable then "const"
-                if pt.Volatile then "volatile" ]
+                if pt.Volatile then "volatile"
+                if pt.Virtual then "virtual" ]
             |> String.concat " "
             
         // building C++ declaration rule
@@ -303,17 +386,19 @@ module ItaniumAbiProcessor =
     [<EntryPoint>]
     let main _args : int =
         let tests = [
-            "_ZN7MyClass6methodEiKPiRiv"
-            "_ZNK7MyClass6methodEiKPiRiv"
-            "_ZNV7MyClass6methodEiVPiRiv"
-            "_ZNKV7MyClass6methodEiViRiv"
-            // C++ templates usage
-            // "_ZNSt6vectorIiSaIiEE5beginEv" // substitutions needed. template matching needed
+            // "_ZN7MyClass6methodEiKPiRiv"
+            // "_ZNK7MyClass6methodEiKPiRiv"
+            // "_ZNV7MyClass6methodEiVPiRiv"
+            // "_ZNKV7MyClass6methodEiViRiv"
+            //"_ZN3std6vectorISt6stringSaIS1_EE5beginEv"
+            "_ZN2ns3fooS0_IiEEv"
+            //"_ZNSbIwSt11char_traitsIwESaIwEEC1Ev"
+            //"_ZNSt6vectorIiSaIiEE5beginEv" // substitutions needed. template matching needed
         ]
         tests
             |> List.iter (fun f ->
                 f
                 |> demangle
-                |> getCppDecl // namespace=class
-                |> printfn "%s")
+                //|> getCppDecl // namespace=class
+                |> printfn "%A")
         0
